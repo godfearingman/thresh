@@ -113,7 +113,8 @@ static bool memops_liftable(const ZydisDecodedInstruction &instr,
     if (op.mem.base == ZYDIS_REGISTER_NONE &&
         op.mem.index == ZYDIS_REGISTER_NONE)
       return false;
-    if (op.mem.base != ZYDIS_REGISTER_RIP &&
+    if (op.mem.base != ZYDIS_REGISTER_NONE &&
+        op.mem.base != ZYDIS_REGISTER_RIP &&
         vtil::zydis_to_vtil_reg(op.mem.base).reg().bit_count !=
             vtil::arch::bit_count)
       return false;
