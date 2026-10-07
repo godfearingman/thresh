@@ -1,0 +1,57 @@
+build/
+.vscode/
+# Files built by Visual Studio
+*_i.c
+*_p.c
+*_h.h
+*.ilk
+*.meta
+*.obj
+*.iobj
+*.pch
+*.pdb
+*.ipdb
+*.pgc
+*.pgd
+*.rsp
+*.sbr
+*.tlb
+*.tli
+*.tlh
+*.tmp
+*.tmp_proj
+*_wpftmp.csproj
+*.log
+*.vspscc
+*.vssscc
+.builds
+*.pidb
+*.svclog
+*.scc
+*.vs
+.vscode/settings.json
+
+# rotated / suffixed run logs (*.log above misses these)
+*.log.*
+run.log.*
+
+# devirtualiser output: ir dumps, pseudo c, diagnostics snapshots
+final_result.txt
+init_ir.txt
+pseudo_c.txt
+diagnostics_*.txt
+*_ir.txt
+*_result.txt
+
+# scratch output dir, for anything generated from here on
+out/
+
+# generated dependency tree dump
+scripts/deps-tree.txt
+
+# editor config: hardcoded absolute include paths, machine specific
+.clangd
+
+# scratch repro project for the vtil expression bug, not part of thresh
+vtil test/
+
