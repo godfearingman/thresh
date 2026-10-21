@@ -175,7 +175,7 @@ int main() {
     vtil::print_unhandled();
   };
 
-  run_test("GetVer_0");
+  run_test("Init");
   std::getchar();
   return 0;
 }
