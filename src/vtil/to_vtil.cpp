@@ -1,10 +1,11 @@
 #include "to_vtil.hpp"
 static void fill_block(vtil::routine *rtn, const basic_block &cfg_block,
                        vtil::basic_block *vtil_block,
-                       std::uint32_t bytecode_vip) {
+                       std::uint32_t bytecode_vip, std::uint32_t entry) {
 
-  auto vip = [bytecode_vip](std::uint32_t rva) {
-    return vtil::to_vip({.rva = rva, .bytecode_vip = bytecode_vip});
+  auto vip = [bytecode_vip, entry](std::uint32_t rva) {
+    return vtil::to_vip(
+        {.rva = rva, .bytecode_vip = bytecode_vip, .entry = entry});
   };
   auto has = [&](std::uint32_t rva) {
     return rtn->explored_blocks.count(vip(rva)) != 0;
@@ -69,7 +70,8 @@ static void fill_block(vtil::routine *rtn, const basic_block &cfg_block,
 }
 
 std::size_t vtil::lift_pending(vtil::routine *rtn, cfg_fn &cfg,
-                               std::uint32_t root, std::uint32_t bytecode_vip) {
+                               std::uint32_t root, std::uint32_t bytecode_vip,
+                               std::uint32_t entry) {
   const auto &blocks = cfg.get_blocks();
 
   std::vector<std::uint32_t> fresh;
@@ -79,7 +81,8 @@ std::size_t vtil::lift_pending(vtil::routine *rtn, cfg_fn &cfg,
     auto rva = work.back();
     work.pop_back();
 
-    const auto key = vtil::to_vip({.rva = rva, .bytecode_vip = bytecode_vip});
+    const auto key = vtil::to_vip(
+        {.rva = rva, .bytecode_vip = bytecode_vip, .entry = entry});
 
     if (!blocks.count(rva) || cfg.is_lifted(key))
       continue;
@@ -97,10 +100,11 @@ std::size_t vtil::lift_pending(vtil::routine *rtn, cfg_fn &cfg,
   for (auto rva : fresh) {
     fill_block(
         rtn, blocks.at(rva),
-        rtn->explored_blocks[vtil::to_vip(
-                                 {.rva = rva, .bytecode_vip = bytecode_vip})]
+        rtn
+            ->explored_blocks[vtil::to_vip(
+                {.rva = rva, .bytecode_vip = bytecode_vip, .entry = entry})]
             .get(),
-        bytecode_vip);
+        bytecode_vip, entry);
   }
 
   spdlog::info("lift_pending: +{} blocks ({} total)", fresh.size(),
