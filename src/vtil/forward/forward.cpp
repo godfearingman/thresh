@@ -129,6 +129,27 @@ vtil::forward::expr_unk(std::uint64_t id) {
   return it != unk_why.end() && it->second.expr ? &it->second.expr : nullptr;
 }
 
+// instead of creating deep expressions of everything, we'll just have a basic
+// check to see how deep the expression is.
+static bool too_big(const vtil::symbolic::expression::reference &e) {
+  if (e->depth > vtil::forward::forward_vm::max_depth)
+    return true;
+
+  std::int32_t cnt = 0;
+
+  e->enumerate([&cnt](const vtil::symbolic::expression &x) { ++cnt; });
+
+  return cnt > 64;
+}
+// vtil has an issue where it dereferences null on register_desc::to_string()
+// for registers that vtil doesn't have a name for, x87 registers in junk
+// decoded as code caused this to arise so we'll just avoid using to_string()
+// and use this format.
+static std::string reg_key(const vtil::register_desc &reg) {
+  return std::format("{:x}.{:x}.{}.{}", static_cast<std::uint64_t>(reg.flags),
+                     reg.combined_id, reg.bit_offset, reg.bit_count);
+}
+
 static bool has_unknown(const vtil::symbolic::expression::reference &e) {
   bool found = false;
   e->enumerate([&found](const vtil::symbolic::expression &x) {
@@ -141,6 +162,39 @@ static bool has_unknown(const vtil::symbolic::expression::reference &e) {
   return found;
 }
 
+static vtil::symbolic::expression::reference
+fresh_unk_lazy(bitcnt_t bits, const std::function<whyinf()> &describe,
+               std::string site) {
+  static std::uint32_t next = 0;
+  static std::unordered_map<std::string, std::uint64_t> id_map;
+  // the difference here vs before is that we're going to make it so that
+  // unknowns that should be the same are re-used instead of creating a
+  // fresh_unk each time. this can be seen by re-running the same block.
+  if (!site.empty()) {
+    std::string key = std::format("{}:{}", site, bits);
+    if (auto it = id_map.find(key); it != id_map.end()) {
+      return vtil::symbolic::variable{
+          vtil::register_desc{vtil::register_virtual, it->second, bits}}
+          .to_expression();
+    }
+    id_map.emplace(std::move(key), 0x100000ull + next);
+  }
+
+  auto id = 0x100000ull + next++;
+
+  unk_why[id] = describe();
+
+  return vtil::symbolic::variable{
+      vtil::register_desc{vtil::register_virtual, id, bits}}
+      .to_expression();
+}
+static vtil::symbolic::expression::reference
+fresh_unk(bitcnt_t bits, std::string why,
+          vtil::symbolic::expression::reference e = {},
+          const std::string &site = {}) {
+  return fresh_unk_lazy(bits, [&] { return whyinf{std::move(why), e}; }, site);
+}
+/*
 static vtil::symbolic::expression::reference
 fresh_unk(bitcnt_t bits, std::string why,
           vtil::symbolic::expression::reference e = {}) {
@@ -157,7 +211,7 @@ fresh_unk(bitcnt_t bits, std::string why,
       vtil::register_desc{vtil::register_virtual, id, bits}}
       .to_expression();
 }
-
+*/
 vtil::symbolic::expression::reference vtil::forward::forward_vm::read_memory(
     const vtil::symbolic::expression::reference &ptr, std::size_t bytes) const {
   std::uint64_t res = 0;
@@ -227,11 +281,15 @@ vtil::symbolic::expression::reference vtil::forward::forward_vm::read_memory(
 void vtil::forward::forward_vm::write_register(
     const vtil::register_desc &reg,
     vtil::symbolic::expression::reference value) {
-  if (value->depth > max_depth && has_unknown(value))
-    value = fresh_unk(reg.bit_count,
-                      std::format("widened {} = {}", reg.to_string(),
-                                  value->to_string().substr(0, 120)),
-                      value);
+  if (too_big(value) && has_unknown(value))
+    value = fresh_unk_lazy(
+        reg.bit_count,
+        [reg, value] {
+          return whyinf{std::format("widened {} = {}", reg.to_string(),
+                                    value->to_string().substr(0, 120)),
+                        value};
+        },
+        site.empty() ? site : site + ":wr:" + reg_key(reg));
   vtil::symbolic_vm::write_register(reg, std::move(value));
 }
 
@@ -240,11 +298,15 @@ bool vtil::forward::forward_vm::write_memory(
     vtil::deferred_value<vtil::symbolic::expression::reference> value,
     bitcnt_t size) {
   auto v = value.get();
-  if (v->depth > max_depth && has_unknown(v))
-    v = fresh_unk(size,
-                  std::format("widened {} = {}", ptr.to_string(),
-                              v->to_string().substr(0, 120)),
-                  v);
+  if (too_big(v) && has_unknown(v))
+    v = fresh_unk_lazy(
+        size,
+        [ptr, v] {
+          return whyinf{std::format("widened {} = {}", ptr.to_string(),
+                                    v->to_string().substr(0, 120)),
+                        v};
+        },
+        site.empty() ? site : site + ":wm");
 
   return vtil::symbolic_vm::write_memory(ptr, v, size);
 }
