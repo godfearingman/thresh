@@ -257,13 +257,18 @@ vtil::forward::states::get(const vtil::basic_block *block) const {
 }
 
 void vtil::forward::states::invalidate(const vtil::basic_block *block) {
-  if (!at_end.erase(block))
-    return;
-
   dirty.insert(block);
+}
 
-  for (auto *b : block->next)
-    invalidate(b);
+void vtil::forward::states::forget(const vtil::basic_block *block) {
+  at_end.erase(block);
+  dirty.erase(block);
+  entries.erase(block);
+  join_sig.erase(block);
+  fork_cond.erase(block);
+  resolved.erase(block);
+  changed.erase(block);
+  end_hash.erase(block);
 }
 
 vtil::symbolic_vm vtil::forward::entry_state() {
