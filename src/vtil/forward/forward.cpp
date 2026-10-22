@@ -454,115 +454,270 @@ join_start(const vtil::basic_block *block, vtil::forward::states &fs,
   return merge_states(inputs, block, fs, sig);
 }
 
-std::size_t vtil::forward::run(const std::vector<vtil::basic_block *> &blocks,
-                               states &fs, const Pe &pe) {
-  std::size_t result = 0;
-  for (const auto &block : blocks) {
-    vtil::symbolic_vm vm;
-    // all entry blocks start from a clean vm state
-    if (fs.entries.count(block))
-      vm = entry_state();
-    // if we've not seen this block but we've seen its predecesser and we've
-    // stored that state then we'll adopt that state for this block too.
-    else if (const auto &prev = block->prev;
-             prev.size() == 1 && fs.get(prev[0])) {
-      vm = *fs.get(prev[0]);
-      // apply stack shift since this block starts at 0
-      vm.write_register(vtil::REG_SP, vm.read_register(vtil::REG_SP) +
-                                          block->prev[0]->sp_offset);
-    }
-    // here is where the magic happens, we now are going to merge multiple
-    // branches
-    else if (block->prev.size() >= 2) {
-      std::string sig;
-      auto merged = join_start(block, fs, sig);
-      if (!merged)
-        continue;
+// split up run to now be able handle loops properly, we shouldn't fold loads
+// too early because in a loop we don't know when that load could suddenly stop
+// being constant. the big mistake currently with how we handle it is that in a
+// loop, on the first iteration the state is already built and everything
+// ongoing is then built off of that.
+static std::optional<vtil::symbolic_vm>
+start_state(const vtil::basic_block *block, vtil::forward::states &fs,
+            std::string &sig) {
+  sig.clear();
 
-      // replace our state with the merged state which accounted for each
-      // predecesser
-      vm = std::move(*merged);
-      fs.join_sig[block] = sig;
-    } else
-      continue;
+  if (fs.entries.count(block))
+    return vtil::forward::entry_state();
 
-    // erase any temporaries as they are block local, we shouldn't carry them
-    // over to each new state especially copied states.
-    std::erase_if(vm.register_state.value_map, [](const auto &kv) {
-      return kv.first.flags & vtil::register_local;
-    });
+  const auto &pred = block->prev;
+  // if we've not seen this block but we've seen its predecesser and we've
+  // stored that state then we'll adopt that state for this block too.
 
-    forward_vm fvm;
-    static_cast<vtil::symbolic_vm &>(fvm) = std::move(vm);
-    fvm.pe = &pe;
+  if (pred.size() == 1)
+    return pred_state(pred[0], fs);
+  // we now are going to merge multiple branches
+  else if (pred.size() >= 2)
+    return join_start(block, fs, sig);
 
-    for (auto it = block->begin(); !it.is_end(); ++it) {
-      // previously we used to have separate passes to fold image loads into
-      // moving their constant value directly in for our tracer but now that we
-      // have this vm state, we will walk each instruction and fold them
-      // directly here.
-      auto why = fvm.execute(*it);
-      if (why != vtil::vm_exit_reason::none) {
-        if (!it->base->is_branching()) {
-          std::string k_why =
-              std::format("{:x} : {}", block->entry_vip, it->to_string());
-          vtil::symbolic::expression::reference k_expr = {};
-          if (it->base == &vtil::ins::ldd) {
-            auto [mb, mo] = it->memory_location();
-            k_expr = (fvm.read_register(mb) + mo).simplify();
-            k_why +=
-                std::format(", ptr = {}", k_expr.to_string().substr(0, 120));
-          }
+  return std::nullopt;
+}
 
-          for (auto [op, type] : it->enum_operands()) {
-            if (type >= vtil::operand_type::write && op.is_register() &&
-                !op.reg().is_stack_pointer())
-              fvm.write_register(op.reg(),
-                                 fresh_unk(op.bit_count(), k_why, k_expr));
-          }
+static vtil::symbolic_vm exec_block(vtil::basic_block *block,
+                                    vtil::symbolic_vm vm, const Pe &pe,
+                                    std::size_t *folded,
+                                    const vtil::instruction *stop = nullptr) {
+  // erase any temporaries as they are block local, we shouldn't carry them
+  // over to each new state especially copied states.
+  std::erase_if(vm.register_state.value_map, [](const auto &kv) {
+    return kv.first.flags & vtil::register_local;
+  });
+
+  vtil::forward::forward_vm fvm;
+  static_cast<vtil::symbolic_vm &>(fvm) = std::move(vm);
+  fvm.pe = &pe;
+
+  std::size_t idx = 0;
+  for (auto it = block->begin(); !it.is_end(); ++it, ++idx) {
+    if (stop && &*it == stop)
+      break;
+
+    fvm.site = std::format("{:x}:{}", block->entry_vip, idx);
+    auto why = fvm.execute(*it);
+    if (why != vtil::vm_exit_reason::none) {
+      // vmprotect can call native functions to which it will leave the vm to
+      // call, under ms x64 calling convention, the callee can clobber every
+      // volatile register and hand its result back in rax, under this knowledge
+      // we should see that none of the registers may survive the call. what we
+      // do to fix this is just turn those registers into fresh unknowns.
+      if (it->base == &vtil::ins::vxcall) {
+        for (auto reg :
+             {ZYDIS_REGISTER_RAX, ZYDIS_REGISTER_RCX, ZYDIS_REGISTER_RDX,
+              ZYDIS_REGISTER_R8, ZYDIS_REGISTER_R9, ZYDIS_REGISTER_R10,
+              ZYDIS_REGISTER_R11}) {
+          auto r = vtil::zydis_to_vtil_reg(reg).reg();
+          fvm.write_register(r,
+                             fresh_unk_lazy(
+                                 r.bit_count,
+                                 [block, it] {
+                                   return whyinf{std::format("{:x} : after {}",
+                                                             block->entry_vip,
+                                                             it.to_string()),
+                                                 {}};
+                                 },
+                                 fvm.site + ":" + reg_key(r)));
         }
+        fvm.write_register(vtil::REG_FLAGS,
+                           fresh_unk_lazy(
+                               vtil::REG_FLAGS.bit_count,
+                               [block, it] {
+                                 return whyinf{std::format("{:x} : after {}",
+                                                           block->entry_vip,
+                                                           it.to_string()),
+                                               {}};
+                               },
+                               fvm.site + ":flags"));
         continue;
       }
 
-      if (it->base == &vtil::ins::ldd) {
-        auto dst = it->operands[0];
-        auto v = fvm.read_register(dst.reg()).simplify();
-        if (v->is_constant()) {
-          (+it)->base = &vtil::ins::mov;
-          (+it)->operands = {
-              dst, vtil::operand{*v->get<std::uint64_t>(), dst.bit_count()}};
-          ++result;
-        }
-      }
-    }
-    /*
-    for (vtil::il_const_iterator it = block->begin();;) {
-      auto [at, why] = fvm.run(it);
-      if (at.is_end())
-        break;
+      if (!it->base->is_branching()) {
 
-      if (!at->base->is_branching()) {
-        for (auto [op, type] : at->enum_operands())
+        for (auto [op, type] : it->enum_operands()) {
           if (type >= vtil::operand_type::write && op.is_register() &&
               !op.reg().is_stack_pointer())
-            fvm.write_register(op.reg(), fresh_unk(op.bit_count()));
+            fvm.write_register(
+                op.reg(),
+                fresh_unk_lazy(
+                    op.bit_count(),
+                    [&] {
+                      std::string k_why = std::format(
+                          "{:x} : {}", block->entry_vip, it->to_string());
+                      vtil::symbolic::expression::reference k_expr = {};
+
+                      if (it->base == &vtil::ins::ldd) {
+                        auto [mb, mo] = it->memory_location();
+                        k_expr = (fvm.read_register(mb) + mo).simplify();
+                        k_why += std::format(", ptr = {}",
+                                             k_expr.to_string().substr(0, 120));
+                      }
+                      return whyinf{std::move(k_why), std::move(k_expr)};
+                    },
+                    fvm.site + ":" + reg_key(op.reg())));
+        }
       }
-      it = std::next(at);
-    }*/
+      continue;
+    }
 
-    fs.at_end[block] = std::move(static_cast<vtil::symbolic_vm &>(fvm));
-
-    // check to see what blocks merged and where it jumps to
-    for (const auto &b : block->next) {
-      // look specifically for joins, they'll have 2 or more predecssors not 1
-      // or that's a fallthrough.
-      if (b->prev.size() < 2 || !fs.get(b))
-        continue;
-
-      std::string sig;
-      if (join_start(b, fs, sig) && sig != fs.join_sig[b])
-        fs.invalidate(b);
+    // previously we used to fold everytime an instruction was executed but now
+    // we've opted to only fold when explicity asked to, this doubles on the
+    // idea that before in a loop we cannot prove that a value that is constant
+    // on one iteration can be constant the next iteration.
+    if (folded && it->base == &vtil::ins::ldd) {
+      auto dst = it->operands[0];
+      auto v = fvm.read_register(dst.reg()).simplify();
+      if (v->is_constant()) {
+        (+it)->base = &vtil::ins::mov;
+        (+it)->operands = {
+            dst, vtil::operand{*v->get<std::uint64_t>(), dst.bit_count()}};
+        ++*folded;
+      }
     }
   }
+  return std::move(static_cast<vtil::symbolic_vm &>(fvm));
+}
+
+static std::uint64_t state_hash(const vtil::symbolic_vm &vm) {
+  auto mix = [](std::uint64_t x) {
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdull;
+    x ^= x >> 33;
+    return x;
+  };
+  std::uint64_t h = 0;
+  const auto &rs = vm.register_state.value_map;
+  for (const auto &[k, seg] : rs) {
+    if (k.flags & vtil::register_local)
+      continue;
+    std::uint64_t e = mix(rs.hash_function()(k)) ^ seg.bitmap;
+    for (std::size_t i = 0; i < 64; ++i)
+      if (seg.linear_store[i])
+        e = mix(e + i * 0x9e3779b97f4a7c15ull +
+                seg.linear_store[i]->hash().as64());
+    h += mix(e);
+  }
+  for (const auto &[ptr, val] : vm.memory_state)
+    h += mix(std::hash<std::string>{}(ptr.to_string()) * 31 +
+             (val ? val->hash().as64() : 0));
+  return h;
+}
+
+std::size_t vtil::forward::run(const std::vector<vtil::basic_block *> &blocks,
+                               states &fs, const Pe &pe) {
+
+  constexpr std::size_t max_laps = 64;
+  std::size_t result = 0;
+
+  std::deque<vtil::basic_block *> work{blocks.begin(), blocks.end()};
+
+  // the main issue we had in the old version of our run was that it could never
+  // really settle on loops,  it kept the same initial state and kept it going
+  // which means something like a counter never really changed, nothing was
+  // recomputed outside of the blocks that were handed to it. this means that
+  // ordinary blocks would keep stale states and nothing would travel downstream
+  // to the other blocks. what we solve here is that when a change is made,
+  // anything linked should be recomputed so that each affected block no longer
+  // has a stale state.
+
+  std::unordered_set<vtil::basic_block *> queued{blocks.begin(), blocks.end()};
+  std::unordered_set<vtil::basic_block *> forced{blocks.begin(), blocks.end()};
+  std::unordered_map<vtil::basic_block *, std::size_t> lap_map;
+
+  while (!work.empty()) {
+    auto *block = work.front();
+    work.pop_front();
+    queued.erase(block);
+
+    std::string sig;
+    auto start = start_state(block, fs, sig);
+
+    // no start state, will be re-queued once a predecessor is being worked
+    if (!start)
+      continue;
+
+    bool force = forced.erase(block) != 0;
+    bool join = block->prev.size() >= 2 && !fs.entries.count(block);
+
+    if (!force && join && fs.get(block)) {
+      auto it = fs.join_sig.find(block);
+      if (it != fs.join_sig.end() && it->second == sig)
+        continue;
+    }
+
+    if (++lap_map[block] > max_laps) {
+      spdlog::warn("[forward] max laps reached for block {:x}, skipping",
+                   block->entry_vip);
+      continue;
+    }
+
+    if (join)
+      fs.join_sig[block] = sig;
+
+    // don't fold to begin with
+    auto out = exec_block(block, std::move(*start), pe, nullptr);
+    auto hash = state_hash(out);
+
+    fs.at_end[block] = std::move(out);
+    fs.changed.insert(block);
+    ++result;
+
+    auto [b_it, inserted] = fs.end_hash.try_emplace(block, hash);
+    if (!inserted &&
+        b_it->second ==
+            hash) // hash already the same, nothing changed just continue
+      continue;
+    // not the same, store and queue successors as this could be a fresh path
+    b_it->second = hash;
+
+    for (auto *b : block->next)
+      if (queued.insert(b).second)
+        work.push_back(b);
+  }
+
+  return result;
+}
+
+vtil::symbolic::expression::reference vtil::forward::value_before(
+    vtil::basic_block *block, vtil::il_const_iterator it,
+    const vtil::register_desc &reg, states &fs, const Pe &pe) {
+
+  std::string sig;
+  auto start = start_state(block, fs, sig);
+
+  if (!start)
+    return {};
+
+  // stop right before where we want to get the value of
+  auto out = exec_block(block, std::move(*start), pe, nullptr, &*it);
+
+  // check if it's a stack pointer adn if it is we'll return the stack address
+  auto val = out.read_register(reg);
+  if (reg.is_stack_pointer())
+    return (val + it->sp_offset).simplify();
+
+  return val.simplify();
+}
+
+std::size_t vtil::forward::fold_loads(vtil::routine *rtn, states &fs,
+                                      const Pe &pe) {
+  std::size_t result = 0;
+
+  for (auto &[vip, block] : rtn->explored_blocks) {
+    if (!fs.get(block.get()))
+      continue;
+
+    std::string sig;
+    if (auto start = start_state(block.get(), fs, sig))
+      exec_block(block.get(), std::move(*start), pe, &result);
+  }
+
+  spdlog::info("[forward] folded {} constant loads", result);
+
   return result;
 }
