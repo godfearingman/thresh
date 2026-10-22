@@ -194,9 +194,24 @@ vtil::symbolic::expression::reference vtil::forward::forward_vm::read_memory(
 
     res = *ptr->get<std::uint64_t>();
     base = pe->get_image_base();
-    if (res >= base && res - base < UINT32_MAX) {
-      auto rb =
-          pe->get_rva_bytes(res - base, static_cast<std::uint32_t>(bytes));
+
+    // we should treat anything read from a writable section as symbolic because
+    // it could be written to and different from the version it is on disk,
+    // anything that isn't in a writable section we should just do as we
+    // normally do and that is read from disk. rip itself is lifted as an rva,
+    // so anything built from it is also an rva
+    std::uint64_t rva = res >= base ? res - base : res;
+    if (rva < pe->get_size()) {
+      for (const auto &sec : pe->get_sections()) {
+        const auto *h = sec.header;
+        if ((h->Characteristics & IMAGE_SCN_MEM_WRITE) &&
+            (rva >= h->VirtualAddress &&
+             rva < h->VirtualAddress + h->Misc.VirtualSize))
+          return vtil::symbolic_vm::read_memory(ptr, bytes);
+      }
+
+      auto rb = pe->get_rva_bytes(static_cast<std::uint32_t>(rva),
+                                  static_cast<std::uint32_t>(bytes));
       std::uint64_t output = 0;
       if (rb.has_value()) {
         std::memcpy(&output, rb->data(), std::min<std::size_t>(rb->size(), 8));
