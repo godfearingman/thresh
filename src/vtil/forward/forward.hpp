@@ -1,5 +1,6 @@
 #pragma once
 
+#include <deque>
 #include <functional>
 
 #include "Zydis/Zydis.h"
