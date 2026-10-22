@@ -1,5 +1,7 @@
 #pragma once
 
+#include <functional>
+
 #include "Zydis/Zydis.h"
 #include "spdlog/spdlog.h"
 #include "vtil/vtil"
