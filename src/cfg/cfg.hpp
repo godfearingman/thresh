@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <queue>
 #include <set>
 #include <string>
@@ -79,11 +80,14 @@ private:
 public:
   // we're going to need to add a method that traverses and decodes from start
   // -> end
-  std::expected<std::monostate, std::string> build_blocks();
+  std::expected<std::monostate, std::string>
+  build_blocks(std::shared_ptr<const vtil::symbolic_vm> seeded = {});
   const std::unordered_map<std::uint32_t, basic_block> &get_blocks() const;
   void set_terminator(std::uint32_t rva, block_terminator new_term,
                       std::vector<std::uint32_t> successors);
-  std::expected<std::monostate, std::string> add_root(const pdb::pdb_fn &fn);
+  std::expected<std::monostate, std::string>
+  add_root(const pdb::pdb_fn &fn,
+           std::shared_ptr<const vtil::symbolic_vm> seeded = {});
   bool split_at(std::uint32_t rva);
   bool is_exec(std::uint64_t rva) const;
 };
