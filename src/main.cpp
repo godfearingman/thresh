@@ -145,6 +145,8 @@ int main() {
         break;
     }
 
+    vtil::forward::fold_loads(trtn, fs, *pe);
+
     vtil::forward::report(trtn, fs, *pe);
     vtil::passes::mark_exits(trtn);
 
