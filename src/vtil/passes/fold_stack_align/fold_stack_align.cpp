@@ -1,14 +1,18 @@
 #include "fold_stack_align.hpp"
 
-
 std::size_t vtil::passes::fold_stack_align(vtil::routine *rtn,
-                                           pe_aware_tracer &tr) {
+                                           pe_aware_tracer &tr,
+                                           vtil::forward::states &fs,
+                                           const Pe &pe) {
   std::size_t result = 0;
   // once we enter a function, we need to make sure there are no stack alignment
   // instructiosn going on so that vtil can continue treating sp as a linear
   // expression.
-  auto sp0 = vtil::symbolic::variable{rtn->entry_point->begin(), vtil::REG_SP}
-                 .to_expression();
+
+  // before we used to tie the sp to the start of a function but now that we've
+  // got our state tracker we can just leave it unbound to the block because
+  // that's what our vm state starts with anyway
+  auto sp0 = vtil::symbolic::variable{vtil::REG_SP}.to_expression();
 
   for (auto &[vip, block] : rtn->explored_blocks) {
     const auto rva = vtil::from_vip(vip).rva;
@@ -20,8 +24,13 @@ std::size_t vtil::passes::fold_stack_align(vtil::routine *rtn,
       spdlog::info("[passes] found stack alignment instruction within rva {:x}",
                    rva);
 
-      // now we need to try and trace reg back to a symbolic value
-      auto val = tr.rtrace(vtil::symbolic::variable{it, it->operands[0].reg()});
+      // use our forward state machine to find the value of the first operand in
+      // the and instruction before the instruction is actually executed
+      auto val =
+          forward::value_before(block.get(), it, it->operands[0].reg(), fs, pe);
+      if (!val)
+        continue;
+
       auto c = (val - sp0).simplify();
 
       // if c comes out as a constant then we can simplify it as we've proven
@@ -48,6 +57,7 @@ std::size_t vtil::passes::fold_stack_align(vtil::routine *rtn,
       }
       result++;
       tr.flush(block.get());
+      fs.invalidate(block.get());
     }
   }
 
