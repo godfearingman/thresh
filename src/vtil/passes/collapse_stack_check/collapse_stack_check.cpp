@@ -66,7 +66,8 @@ static void unlink(vtil::basic_block *a, vtil::basic_block *b) {
 
 std::size_t vtil::passes::collapse_stack_checks(vtil::routine *rtn,
                                                 const cfg_fn &cfg,
-                                                pe_aware_tracer &tr) {
+                                                pe_aware_tracer &tr,
+                                                vtil::forward::states &fs) {
   std::size_t result = 0;
   const auto &candidates = get_canditates(rtn);
 
@@ -98,9 +99,17 @@ std::size_t vtil::passes::collapse_stack_checks(vtil::routine *rtn,
 
       unlink(path.back(), join);
 
+      // mark it dirty as its merge has changed
+      fs.invalidate(join);
+
       // delete said blocks.
-      for (auto *b : path)
+      for (auto *b : path) {
+        // clear it from every vm map, if the address is re-used later on it
+        // will end up inheriting this dead state. or worse, if it's keyed after
+        // deleted, we'll crash on deref because our maps are keyed by pointers.
+        fs.forget(b);
         rtn->delete_block(b);
+      }
 
       ++result;
       break;
