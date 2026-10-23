@@ -77,7 +77,7 @@ int main() {
     vtil::forward::states fs;
     fs.entries.insert(trtn->entry_point);
 
-    vtil::passes::fold_stack_align(trtn, tr);
+    vtil::passes::fold_stack_align(trtn, tr, fs, *pe);
     trtn->entry_point->insert(
         trtn->entry_point->begin(),
         vtil::instruction{&vtil::ins::band,
@@ -123,7 +123,7 @@ int main() {
 
         fs.dirty.clear();
 
-        vtil::passes::fold_stack_align(trtn, tr);
+        vtil::passes::fold_stack_align(trtn, tr, fs, *pe);
         std::size_t folded = vtil::forward::run(ordered, fs, *pe);
 
         for (auto *b : ordered)
