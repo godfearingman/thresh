@@ -131,7 +131,7 @@ int main() {
 
         auto resolved =
             vtil::passes::resolve_indirects(trtn, tcfg, *pe, tr, exit_vips, fs);
-        vtil::passes::collapse_stack_checks(trtn, tcfg, tr);
+        vtil::passes::collapse_stack_checks(trtn, tcfg, tr, fs);
         spdlog::info("iter {}: optimising {} blocks", ++iter,
                      trtn->explored_blocks.size());
         spdlog::info("iter {}: done", iter);
