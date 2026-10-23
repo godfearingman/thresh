@@ -3,8 +3,10 @@
 #include "vtil/vtil"
 
 #include "../../../pe/tracer/tracer.hpp"
+#include "../../../vtil/forward/forward.hpp"
 #include "../../block_key/block_key.hpp"
 
 namespace vtil::passes {
-std::size_t fold_stack_align(vtil::routine *rtn, pe_aware_tracer &tr);
+std::size_t fold_stack_align(vtil::routine *rtn, pe_aware_tracer &tr,
+                             vtil::forward::states &fs, const Pe &pe);
 }
