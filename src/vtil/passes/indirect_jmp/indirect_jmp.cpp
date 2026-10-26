@@ -1,20 +1,24 @@
 #include "indirect_jmp.hpp"
 
-// keep a map of what each resolved handler uses for its vip
+// keep a map of what each resolved handler uses for its ctx, previously we had
+// this as the vip but we see virtualised functions being built up off of
+// multiple vm entries and for that we cannot just see bytecode vip 0 (entry) as
+// a unique identifier. this is why we switched to a newer identifier which
+// bases off of the context of where it was entered from.
 static std::unordered_map<std::uint32_t, ZydisRegister> vip_regs;
 static std::unordered_map<std::uint32_t, ZydisRegister> key_regs;
 
 // what detect_vip actually found, NONE if it never managed to work it out.
-static ZydisRegister vip_detected(std::uint32_t bytecode_vip) {
-  auto it = vip_regs.find(bytecode_vip);
+static ZydisRegister vip_detected(std::uint32_t ctx) {
+  auto it = vip_regs.find(ctx);
   return it != vip_regs.end() ? it->second : ZYDIS_REGISTER_NONE;
 }
-static ZydisRegister vip_reg(std::uint32_t bytecode_vip) {
-  auto r = vip_detected(bytecode_vip);
+static ZydisRegister vip_reg(std::uint32_t ctx) {
+  auto r = vip_detected(ctx);
   return r != ZYDIS_REGISTER_NONE ? r : ZYDIS_REGISTER_R11;
 }
-static ZydisRegister key_reg(std::uint32_t bytecode_vip) {
-  auto it = key_regs.find(bytecode_vip);
+static ZydisRegister key_reg(std::uint32_t ctx) {
+  auto it = key_regs.find(ctx);
   return it != key_regs.end() ? it->second : ZYDIS_REGISTER_NONE;
 }
 
@@ -64,9 +68,9 @@ split_on_bit(const vtil::symbolic::expression::reference &e) {
 
 static vtil::basic_block *find_fork_point(vtil::basic_block *block,
                                           const vtil::forward::states &fs) {
-  auto r11 = vtil::zydis_to_vtil_reg(
-      vip_reg(vtil::from_vip(block->entry_vip).bytecode_vip));
-  auto vm_vip = vtil::from_vip(block->entry_vip).bytecode_vip;
+  auto r11 =
+      vtil::zydis_to_vtil_reg(vip_reg(vtil::context_of(block->entry_vip)));
+  auto vm_ctx = vtil::context_of(block->entry_vip);
 
   auto is_r11_const = [&](vtil::basic_block *b) {
     auto *s = fs.get(b);
@@ -78,8 +82,7 @@ static vtil::basic_block *find_fork_point(vtil::basic_block *block,
     if (curr->prev.size() != 1)
       break;
     else if (auto prev = curr->prev[0];
-             vtil::from_vip(prev->entry_vip).bytecode_vip != vm_vip ||
-             is_r11_const(prev))
+             vtil::context_of(prev->entry_vip) != vm_ctx || is_r11_const(prev))
       break;
 
     curr = curr->prev[0];
@@ -143,8 +146,9 @@ resolve_vip(vtil::basic_block *blk, pe_aware_tracer &tr, const Pe &pe,
   // essentially, when we parse a jmp target we need to figure out what the next
   // target is which revolves around r11. the only time this changes is when
   // we've had to deal with multiple predecessor blocks (forks/merge)
-  auto r11 = vtil::zydis_to_vtil_reg(
-      vip_reg(vtil::from_vip(blk->entry_vip).bytecode_vip));
+
+  //^^ we were obviously wrong about r11 but the main premise is still valid.
+  auto r11 = vtil::zydis_to_vtil_reg(vip_reg(vtil::context_of(blk->entry_vip)));
   vtil::symbolic::variable var{std::prev(blk->end()), r11.reg()};
 
   if (auto *s = fs.get(blk)) {
@@ -549,9 +553,10 @@ static void pin_vm_state(vtil::basic_block *new_block, vtil::basic_block *src,
   // pinning those values if the values conflict, this should be okay because we
   // know that it should hold the value we're going to pin anyway
   bool vip_conflicts = false;
+  std::uint32_t ctx = vtil::context_of(vtil::to_vip(bk));
   auto *s = fs.get(src);
-  if (s && vip_detected(bk.bytecode_vip) != ZYDIS_REGISTER_NONE) {
-    auto vr = vtil::zydis_to_vtil_reg(vip_detected(bk.bytecode_vip));
+  if (s && vip_detected(ctx) != ZYDIS_REGISTER_NONE) {
+    auto vr = vtil::zydis_to_vtil_reg(vip_detected(ctx));
     auto have = s->read_register(vr.reg()).simplify();
     if (have->is_constant())
       vip_conflicts =
@@ -568,24 +573,23 @@ static void pin_vm_state(vtil::basic_block *new_block, vtil::basic_block *src,
   // resolve differently so we need to figure it out if we've resolved it
   // already
   if (bk.bytecode_vip && !vip_conflicts &&
-      vip_detected(bk.bytecode_vip) != ZYDIS_REGISTER_NONE)
+      vip_detected(ctx) != ZYDIS_REGISTER_NONE)
     new_block->insert(
         new_block->begin(),
         vtil::instruction{
             &vtil::ins::mov,
-            {vtil::zydis_to_vtil_reg(vip_detected(bk.bytecode_vip)),
+            {vtil::zydis_to_vtil_reg(vip_detected(ctx)),
              vtil::operand{bk.bytecode_vip + pe.get_image_base(), 64}}});
 
   // now we'll iterate over all the pins from our deduced vm profile and do the
   // same.
   auto pins = vm ? vm->pins() : std::vector{ZYDIS_REGISTER_R8};
-  if (auto r = key_reg(bk.bytecode_vip);
-      r != ZYDIS_REGISTER_NONE && pins.size() > 1)
+  if (auto r = key_reg(ctx); r != ZYDIS_REGISTER_NONE && pins.size() > 1)
     pins[1] = r;
 
   for (const auto &pin : pins) {
     auto reg = vtil::zydis_to_vtil_reg(pin);
-    if (pin == vip_detected(bk.bytecode_vip))
+    if (pin == vip_detected(ctx))
       continue; // already pinned above with the right value
     // use our vm state at any possible chance we can.
     if (s) {
@@ -674,7 +678,7 @@ std::size_t vtil::passes::resolve_indirects(
     if (blk->empty())
       continue;
 
-    if (exit_vips.count(vtil::from_vip(vip).bytecode_vip))
+    if (exit_vips.count(vtil::context_of(vip)))
       continue;
 
     auto &last = blk->back();
@@ -690,8 +694,8 @@ std::size_t vtil::passes::resolve_indirects(
       if (!b)
         continue;
 
-      auto r11 = vtil::zydis_to_vtil_reg(
-          vip_reg(vtil::from_vip(blk->entry_vip).bytecode_vip));
+      auto r11 =
+          vtil::zydis_to_vtil_reg(vip_reg(vtil::context_of(blk->entry_vip)));
       auto vals = split_on_bit(fs.get(b)->read_register(r11.reg()).simplify());
       if (!vals)
         continue;
@@ -737,8 +741,9 @@ std::size_t vtil::passes::resolve_indirects(
           break;
         }
         auto vip = detect_vip(cfg, s_rva);
-        vip_regs[bk.bytecode_vip] = vip;
-        key_regs[bk.bytecode_vip] = detect_key(cfg, s_rva, vip);
+        auto vm_ctx = vtil::context_of(vtil::to_vip(bk));
+        vip_regs[vm_ctx] = vip;
+        key_regs[vm_ctx] = detect_key(cfg, s_rva, vip);
         pin_vm_state(rtn->explored_blocks[keys[idx]].get(), b, tr, pe, bk,
                      resolve_vm_profile(cfg, bk.rva), fs);
       }
@@ -801,7 +806,10 @@ std::size_t vtil::passes::resolve_indirects(
       spdlog::info("[resolve] parsed vip to be 0x{:x} from rva 0x{:x}",
                    bytecode_vip, rva);
 
-    vtil::block_key bk = {.rva = rva, .bytecode_vip = bytecode_vip};
+    vtil::block_key bk = {
+        .rva = rva,
+        .bytecode_vip = bytecode_vip,
+        .entry = !bytecode_vip ? vtil::from_vip(blk->entry_vip).entry : 0};
     const auto key = vtil::to_vip(bk);
 
     if (!rtn->explored_blocks.count(key)) {
@@ -811,7 +819,7 @@ std::size_t vtil::passes::resolve_indirects(
       if (is_vmexit(rva, pe)) {
         spdlog::info("[resolve] vm exit at {:x} (bytecode 0x{:x})", rva,
                      bytecode_vip);
-        exit_vips.insert(bytecode_vip);
+        exit_vips.insert(vtil::context_of(key));
       }
 
       if (auto r = cfg.add_root(pdb::pdb_fn{
@@ -819,14 +827,15 @@ std::size_t vtil::passes::resolve_indirects(
           !r.has_value())
         spdlog::warn("[resolve] add_root {:x} failed: {}", bk.rva, r.error());
 
-      vtil::lift_pending(rtn, cfg, bk.rva, bk.bytecode_vip);
+      vtil::lift_pending(rtn, cfg, bk.rva, bk.bytecode_vip, bk.entry);
       if (!rtn->explored_blocks.count(key)) {
         spdlog::warn("[resolve] target {:x} lifted nothing, skipping", rva);
         continue;
       }
       auto vip = detect_vip(cfg, rva);
-      vip_regs[bk.bytecode_vip] = vip;
-      key_regs[bk.bytecode_vip] = detect_key(cfg, rva, vip);
+      auto vm_ctx = vtil::context_of(vtil::to_vip(bk));
+      vip_regs[vm_ctx] = vip;
+      key_regs[vm_ctx] = detect_key(cfg, rva, vip);
 
       auto &new_block = rtn->explored_blocks[key];
 
