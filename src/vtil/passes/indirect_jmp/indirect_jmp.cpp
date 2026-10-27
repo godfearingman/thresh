@@ -666,6 +666,82 @@ std::size_t vtil::passes::resolve_indirects(
     vtil::routine *rtn, cfg_fn &cfg, const Pe &pe, pe_aware_tracer &tr,
     std::unordered_set<std::uint32_t> &exit_vips, vtil::forward::states &fs) {
   std::size_t resolved = 0;
+
+  // when resolving loops we need to make sure that the condition has changed or
+  // not in terms of if the loop has ended. the reason why we do this is because
+  // if we just treat loops as normal jmps, we'll never discover the loop exit
+  // and it will just resolve it once as the header instead of the real exit,
+  // this is because on the first pass, without this, we would treat the
+  // condition as solvable and not in the favour of discovering both paths (the
+  // header and the exit). once the condition changes, we revert the change we
+  // made where we first changed the jmp.
+  for (const auto *changed : fs.changed) {
+    auto it = fs.resolved.find(changed);
+    if (it == fs.resolved.end())
+      continue;
+
+    auto *s = fs.get(changed);
+    if (!s)
+      continue;
+
+    const auto &resolved_t = it->second;
+    auto old_op = s->read_register(resolved_t.op.reg()).simplify();
+    auto vip = s->read_register(resolved_t.vip_reg).simplify();
+    auto *b = const_cast<vtil::basic_block *>(changed);
+
+    std::optional<std::uint64_t> vip_now;
+    if (vip->is_constant()) {
+      std::uint64_t raw_val = *vip->get<std::uint64_t>();
+      std::uint64_t image_base = pe.get_image_base();
+      if (raw_val >= image_base && raw_val - image_base < UINT32_MAX)
+        vip_now = raw_val;
+    }
+
+    if (old_op->is_constant() &&
+        *old_op->get<std::uint64_t>() == resolved_t.targ &&
+        (!resolved_t.vip || resolved_t.vip == vip_now))
+      continue; // nothing has changed, keep as is.
+    else if (!old_op->is_constant()) {
+      auto *fork = find_fork_point(b, fs);
+      auto v_reg =
+          vtil::zydis_to_vtil_reg(vip_reg(vtil::context_of(b->entry_vip)))
+              .reg();
+
+      if (!fork ||
+          !split_on_bit(fs.get(fork)->read_register(v_reg).simplify())) {
+        // nothing better to do here just remove it and continue as is.
+        spdlog::warn("[resolve] {:x} no longer jmps to a constant but doesn't "
+                     "split on bit, keeping as {:x}",
+                     b->entry_vip, resolved_t.key);
+        fs.resolved.erase(it);
+        continue;
+      }
+    }
+
+    // return back to normal so it can be resolved properly this time.
+    spdlog::info("[resolve] {:x} no longer jmps to {:x} (target {:x} -> {}, "
+                 "vip {} -> {})",
+                 b->entry_vip, resolved_t.key, resolved_t.targ,
+                 old_op->to_string().substr(0, 120),
+                 resolved_t.vip ? std::format("{:#x}", *resolved_t.vip)
+                                : "none",
+                 vip_now ? std::format("{:#x}", *vip_now) : "none");
+
+    b->pop_back();
+    b->jmp(resolved_t.op);
+
+    if (auto it_b = rtn->explored_blocks.find(resolved_t.key);
+        it_b != rtn->explored_blocks.end()) {
+      unlink(b, it_b->second.get());
+      fs.invalidate(it_b->second.get());
+    }
+
+    tr.flush(b);
+    fs.resolved.erase(it);
+  }
+
+  fs.changed.clear();
+
   std::vector<vtil::vip_t> vips;
   for (auto &[vip, _] : rtn->explored_blocks)
     vips.push_back(vip);
@@ -751,9 +827,8 @@ std::size_t vtil::passes::resolve_indirects(
         continue;
 
       if (same < 0) {
-        fs.invalidate(s);
         for (auto *x : tail) {
-          fs.dirty.erase(x);
+          fs.forget(x);
           tr.flush(x);
         }
 
@@ -782,9 +857,7 @@ std::size_t vtil::passes::resolve_indirects(
       fs.fork_cond[b] = vals->bit;
 
       for (const auto &k : keys)
-        if (auto t = rtn->explored_blocks[k].get();
-            t->prev.size() >= 2 && fs.get(t))
-          fs.invalidate(t);
+        fs.invalidate(rtn->explored_blocks[k].get());
       ++resolved;
       continue;
     }
@@ -844,14 +917,21 @@ std::size_t vtil::passes::resolve_indirects(
       pin_vm_state(new_block.get(), blk, tr, pe, bk, vmp, fs);
     }
 
+    // store any information regarding the jmp when we resolve it, this is to do
+    // with fixing loops having an early exit once resolved.
+    if (auto op = blk->back().operands[0]; op.is_register())
+      fs.resolved[blk] = {
+          op, target,
+          vtil::zydis_to_vtil_reg(vip_reg(vtil::context_of(blk->entry_vip)))
+              .reg(),
+          vip_return, key};
+
     blk->pop_back();
     blk->jmp(key);
     blk->fork(key);
     tr.flush(blk);
 
-    if (auto *t = rtn->explored_blocks[key].get();
-        t->prev.size() >= 2 && fs.get(t))
-      fs.invalidate(t);
+    fs.invalidate(rtn->explored_blocks[key].get());
 
     resolved++;
   }
