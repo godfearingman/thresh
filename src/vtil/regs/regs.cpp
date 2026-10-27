@@ -143,9 +143,9 @@ void vtil::store_operand(vtil::basic_block *block,
       // on 32 bit registers we need to zero the upper bits
       vtil::operand full = dst;
       full.reg().bit_count = 64;
-      auto wide = block->tmp(64);
-      block->mov(wide, src);
-      block->mov(full, wide);
+      auto low = block->tmp(32);
+      block->mov(low, src);
+      block->mov(full, low);
       break;
     }
     block->mov(dst, src);
