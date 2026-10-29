@@ -742,7 +742,7 @@ static bool import_call(vtil::routine *rtn, cfg_fn &cfg, vtil::basic_block *b,
       static_cast<std::uint32_t>(ret >= img_base ? ret - img_base : ret);
 
   if (!cfg.add_root(
-          {.fn_name = "vm_import_call", .fn_rva = rva, .fn_size = 0x200}))
+          {.fn_name = "vm_re_entry", .fn_rva = rva, .fn_size = 0x200}))
     spdlog::warn("[passes] failed to add root for {:x}", rva);
 
   // if [sp] doesn't store a valid vm entry then we're not lifting the right
