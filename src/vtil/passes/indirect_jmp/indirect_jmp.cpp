@@ -1,5 +1,7 @@
 #include "indirect_jmp.hpp"
 
+#include "../chain_sections/chain_sections.hpp"
+
 // keep a map of what each resolved handler uses for its ctx, previously we had
 // this as the vip but we see virtualised functions being built up off of
 // multiple vm entries and for that we cannot just see bytecode vip 0 (entry) as
@@ -662,6 +664,122 @@ static void unlink(vtil::basic_block *a, vtil::basic_block *b) {
   std::erase(b->prev, a);
 }
 
+// return a copy of the vm state of a blocks end state with the sp corrected,
+// used later for the cfg walker. the reason why it's used is just so we can
+// fold the opaques as we should have all the values required at that point as
+// constants. typically, you'll see the opaques present heavily when you jump to
+// the import glue (the block that sets up the import call)
+static std::shared_ptr<vtil::symbolic_vm> walk_seed(vtil::basic_block *b,
+                                                    vtil::forward::states &fs) {
+  auto *s = fs.get(b);
+  if (!s)
+    return {};
+
+  auto vm = std::make_shared<vtil::symbolic_vm>(*s);
+  auto it = std::prev(b->end());
+
+  vm->write_register(vtil::REG_SP,
+                     vm->read_register(vtil::REG_SP) + it->sp_offset);
+
+  return vm;
+}
+
+static bool in_image(const Pe &pe, std::uint64_t addr) {
+  const std::uint64_t img_base = pe.get_image_base();
+  return (addr >= img_base ? addr - img_base : addr) < pe.get_size();
+}
+
+static std::optional<std::uint64_t> import_return(vtil::basic_block *b,
+                                                  std::uint64_t target,
+                                                  const Pe &pe,
+                                                  vtil::forward::states &fs) {
+  // we're only looking for import calls so we should ignore anything in the
+  // main image
+  if (in_image(pe, target))
+    return std::nullopt;
+
+  auto *s = fs.get(b);
+  if (!s)
+    return std::nullopt;
+
+  // read [sp], same thing we did in return_on_stack in chain_sections.
+  auto it = std::prev(b->end());
+  auto sp = (s->read_register(vtil::REG_SP) + it->sp_offset).simplify();
+
+  auto mem = s->read_memory(sp, 8);
+  if (!mem)
+    return std::nullopt;
+  mem.simplify();
+
+  if (!mem->is_constant())
+    return std::nullopt;
+
+  std::uint64_t raw = *mem->get<std::uint64_t>();
+
+  // [sp] should be in image if it's going to be the vm-reentry
+  if (!in_image(pe, raw))
+    return std::nullopt;
+
+  return raw;
+}
+
+// just like our native_call in chain_sections, we'll do the same thing here
+// except for handling import calls as they are slightly different from how
+// native calls are discovered. the initial import stub after vmexit is already
+// lifted as vm code because the stub's early instructions look like a vm entry,
+// we need to now add this check here because chain_sections already sees this
+// as a vm-entry block, the operations done here are still native code though -
+// they're just essentially figuring out what api call this is and then jmping
+// to it - that's why we'll stitch it together here, all we have to do is
+// replace the final jmp to the import with a vxcall and then link it back to
+// the newly lifted re-entry block in [sp]
+static bool import_call(vtil::routine *rtn, cfg_fn &cfg, vtil::basic_block *b,
+                        std::uint64_t target, std::uint64_t ret, const Pe &pe,
+                        pe_aware_tracer &tr, vtil::forward::states &fs) {
+
+  const std::uint64_t img_base = pe.get_image_base();
+  const std::uint32_t rva =
+      static_cast<std::uint32_t>(ret >= img_base ? ret - img_base : ret);
+
+  if (!cfg.add_root(
+          {.fn_name = "vm_import_call", .fn_rva = rva, .fn_size = 0x200}))
+    spdlog::warn("[passes] failed to add root for {:x}", rva);
+
+  // if [sp] doesn't store a valid vm entry then we're not lifting the right
+  // thing. and [sp] is most likely a junk path.
+  if (!vtil::passes::classify_entry(cfg, rva).ok()) {
+    spdlog::info("[passes] {:x} not recognised as a valid handler, skipping",
+                 rva);
+    return false;
+  }
+
+  vtil::lift_pending(rtn, cfg, rva, 0, rva);
+  vtil::block_key bk = {.rva = rva, .bytecode_vip = 0, .entry = rva};
+  vtil::vip_t key = vtil::to_vip(bk);
+
+  if (!rtn->explored_blocks.count(key))
+    return false;
+
+  spdlog::info("[passes] lifted import call in {:x} to {:x} resume at {:x}",
+               b->entry_vip, target, rva);
+
+  // there's no point rewriting this call to use a strict imm, instead we'll
+  // keep it symbolic because the import slots are filled on runtime rather than
+  // on disk, if we baked in the raw imm it would just be garbage. regardless,
+  // we'll do the same thing - store the operand, shift sp to match the push and
+  // rewrite to a vxcall :steamhappy:
+  auto op = std::prev(b->end())->operands[0];
+  b->pop_back();
+  b->shift_sp(8);
+  b->vxcall(op);
+  b->fork(key);
+
+  tr.flush(b);
+  fs.invalidate(b);
+
+  return true;
+}
+
 std::size_t vtil::passes::resolve_indirects(
     vtil::routine *rtn, cfg_fn &cfg, const Pe &pe, pe_aware_tracer &tr,
     std::unordered_set<std::uint32_t> &exit_vips, vtil::forward::states &fs) {
@@ -870,6 +988,12 @@ std::size_t vtil::passes::resolve_indirects(
     if (folded && rtn->explored_blocks.count(target))
       continue;
 
+    if (auto imp_addr = import_return(blk, target, pe, fs); imp_addr) {
+      if (import_call(rtn, cfg, blk, target, *imp_addr, pe, tr, fs))
+        ++resolved;
+      continue;
+    }
+
     const auto rva = vtil::from_vip(target).rva;
     auto vip_return = resolve_vip(blk, tr, pe, fs);
     std::uint32_t bytecode_vip =
@@ -895,8 +1019,10 @@ std::size_t vtil::passes::resolve_indirects(
         exit_vips.insert(vtil::context_of(key));
       }
 
-      if (auto r = cfg.add_root(pdb::pdb_fn{
-              .fn_name = "vm_handler", .fn_rva = bk.rva, .fn_size = 0x200});
+      if (auto r = cfg.add_root(pdb::pdb_fn{.fn_name = "vm_handler",
+                                            .fn_rva = bk.rva,
+                                            .fn_size = 0x200},
+                                walk_seed(blk, fs));
           !r.has_value())
         spdlog::warn("[resolve] add_root {:x} failed: {}", bk.rva, r.error());
 
