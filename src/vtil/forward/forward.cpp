@@ -11,7 +11,7 @@ bool vtil::forward::never_in_image(
     const vtil::symbolic::expression::reference &targ, const Pe &pe) {
   std::uint64_t base = pe.get_image_base();
 
-  for (std::uint64_t fill : {0ull, 1ull, ~0ull, base, base + 0x1000}) {
+  for (std::uint64_t fill : {std::uint64_t{0}, std::uint64_t{1}, ~std::uint64_t{0}, base, base + 0x1000}) {
     // need to use as_const here in order to not rewrite the value we're trying
     // to probe.
     auto probe = std::as_const(targ)

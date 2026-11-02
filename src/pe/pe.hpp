@@ -1,12 +1,14 @@
 #pragma once
 
+#ifdef _WIN32
 #include <Windows.h>
+#endif
 #include <cstdint>
 #include <expected>
 #include <span>
 #include <string>
 #include <vector>
-#include <winnt.h>
+#include "winnt.h"
 
 // #include "section.h"
 

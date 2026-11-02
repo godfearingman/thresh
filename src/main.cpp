@@ -1,4 +1,6 @@
+#ifdef _WIN32
 #include <Windows.h>
+#endif
 #include <algorithm>
 #include <cstdio>
 #include <functional>
@@ -24,14 +26,16 @@
 #include "spdlog/spdlog.h"
 
 #undef min
-int main() {
+int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
-  std::string pdb_path =
-      "C:\\Users\\sohai\\source\\repos\\obf\\build\\Release\\tests\\virt\\test."
-      "pdb";
-  std::string file_path =
-      "C:\\Users\\sohai\\source\\repos\\obf\\build\\Release\\tests\\virt\\test."
-      "dll";
+  if (argc < 3) {
+    std::fprintf(stderr, "usage: %s <pdb> <pe-file> [function-substring]\n",
+                 argc > 0 ? argv[0] : "thresh");
+    return 2;
+  }
+  std::string pdb_path = argv[1];
+  std::string file_path = argv[2];
+  std::string fn_filter = argc > 3 ? argv[3] : std::string();
   pdb::pdb_parser pdb(pdb_path);
 
   auto fns = pdb.get_fns();
@@ -39,16 +43,14 @@ int main() {
   if (!fns.has_value()) {
     spdlog::error(" failed to get functions with error {}",
                   fns.error().c_str());
-    std::getchar();
-    return 0;
+    return 1;
   }
 
   auto file_bytes = pdb.get_file_info(file_path);
   if (!file_bytes.has_value()) {
     spdlog::error(" failed to get file info with error {}",
                   file_bytes.error().c_str());
-    std::getchar();
-    return 0;
+    return 1;
   }
 
   const Pe *pe = new Pe(*file_bytes, "main image");
@@ -177,7 +179,17 @@ int main() {
     vtil::print_unhandled();
   };
 
-  run_test("Init");
-  std::getchar();
+  if (fn_filter == "--list") {
+    for (const auto &fn : *fns)
+      std::printf("0x%08x %6u %s\n", fn.fn_rva, fn.fn_size,
+                  fn.fn_name.c_str());
+    return 0;
+  }
+  if (!fn_filter.empty()) {
+    run_test(fn_filter.c_str());
+  } else {
+    for (const auto &fn : *fns)
+      run_test(std::string(fn.fn_name).c_str());
+  }
   return 0;
 }

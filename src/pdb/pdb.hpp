@@ -1,6 +1,10 @@
 #pragma once
 
+#ifdef _WIN32
+#ifdef _WIN32
 #include <Windows.h>
+#endif
+#endif
 #include <algorithm>
 #include <expected>
 #include <format>
@@ -115,6 +119,8 @@ public:
         pdb_dbi.CreateImageSectionStream(*pdb_file);
 
     for (const auto &mod : pdb_mis.GetModules()) {
+      if (!mod.HasSymbolStream())
+        continue; // clang/zig/lld PDBs list modules without symbol streams
       PDB::ModuleSymbolStream pdb_syms = mod.CreateSymbolStream(*pdb_file);
 
       pdb_syms.ForEachSymbol([&functions, &seen_fn, &pdb_iss](

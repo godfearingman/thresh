@@ -43,7 +43,7 @@ file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS src/*.cpp)
 add_executable(thresh ${SOURCES})
 
 target_compile_definitions(thresh PRIVATE _SILENCE_ALL_CXX23_DEPRECATION_WARNINGS)
-target_link_options(thresh PRIVATE /STACK:536870912)   
+target_link_options(thresh PRIVATE $<$<PLATFORM_ID:Windows>:/STACK:536870912>)   
 
 target_link_libraries(thresh PRIVATE
     raw_pdb
