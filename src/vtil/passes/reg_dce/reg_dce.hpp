@@ -1,5 +1,7 @@
 #pragma once
 
+#include <deque>
+
 #include "spdlog/spdlog.h"
 #include "vtil/vtil"
 
