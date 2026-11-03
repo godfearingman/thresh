@@ -17,6 +17,7 @@
 #include "vtil/passes/fold_tamper_fork/fold_tamper_fork.hpp"
 #include "vtil/passes/indirect_jmp/indirect_jmp.hpp"
 #include "vtil/passes/mark_exits/mark_exits.hpp"
+#include "vtil/passes/reg_dce/reg_dce.hpp"
 
 #include "vtil/forward/forward.hpp"
 #include "vtil/forward/report/report.hpp"
@@ -146,6 +147,7 @@ int main() {
     }
 
     vtil::forward::fold_loads(trtn, fs, *pe);
+    vtil::passes::reg_dce(trtn);
 
     vtil::forward::report(trtn, fs, *pe);
     vtil::passes::mark_exits(trtn);
