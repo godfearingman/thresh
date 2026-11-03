@@ -107,4 +107,106 @@ struct live_set {
   }
 };
 
+bool removeable(const vtil::instruction &instr) {
+  // list of what not to optimise away in our dce; anything that branches,
+  // writes memory, is volatile, has at least one register operand, does not
+  // touch sp
+  auto *desc = instr.base;
+  if (desc->is_branching() || instr.is_volatile() || desc->memory_write)
+    return false;
+
+  std::size_t reg_count = 0;
+  for (std::size_t idx = 0; idx < desc->operand_count(); ++idx) {
+    const vtil::operand_type &t = desc->operand_types[idx];
+    const vtil::operand &op = instr.operands[idx];
+
+    if (t == vtil::operand_type::read)
+      continue;
+
+    if (t >= vtil::operand_type::write) {
+      const auto &reg = op.reg();
+      if (reg.is_volatile() || reg.is_stack_pointer())
+        return false;
+
+      ++reg_count;
+    }
+  }
+
+  if (!reg_count)
+    return false;
+
+  return true;
+}
+
+// now that we have our helper function that will reject any non removeable
+// instruction, we need another function which tells us what to do when we
+// encounter one of these.
+bool step(const vtil::instruction &instr, live_set &t) {
+  auto *base = instr.base;
+
+  // if it's volatile or the instruction is any of these, capture all registers
+  if (base == &vtil::ins::vexit || base == &vtil::ins::vxcall ||
+      instr.is_volatile()) {
+    t.all();
+    return true;
+  }
+
+  if (!removeable(instr)) {
+    for (const auto &[op, _] : instr.enum_operands()) {
+      if (!op.is_register())
+        continue;
+      t.add(op.reg());
+    }
+    return true;
+  } else {
+    for (const auto &[op, type] : instr.enum_operands()) {
+
+      // first check if it's a register that's written to
+      if (type >= vtil::operand_type::write) {
+
+        // can't write to anything but a register so we don't need to do any
+        // checks here.
+        auto reg = op.reg();
+        auto id = reg.weaken();
+        const std::uint64_t bits = t.get(id);
+        const std::uint64_t mask = mask_of(reg);
+
+        // already dead so just return false so that it can be removed
+        if (!(bits & mask))
+          return false;
+        else {
+          // at this point we need to check if it's a plain write or a
+          // readwrite, this is because if it were a write then it should be
+          // treated as dead on next encounter, if it's a readwrite then it's
+          // essentially being immediately read after writing which would be the
+          // case if it were split up. tldr; treat readwrite's as still live
+          type == vtil::operand_type::readwrite ? t.add(reg) : t.remove(reg);
+          continue;
+        }
+      } else {
+        // unlike with write where it can only write to registers, with read we
+        // can read either imm's or memory as well as registers. we need to
+        // specifically catch any reads but only target operands who are
+        // registers because the way the IL is stored doesn't build it from or
+        // operations but rather as strict enum values. cases like mov's source
+        // accepts stricyl read/read_any. this just means we'll need to do a
+        // check to see if we're actually dealing with a register or not.
+
+        if (!op.is_register())
+          continue;
+
+        auto reg = op.reg();
+        auto id = reg.weaken();
+        const std::uint64_t bits = t.get(id);
+        const std::uint64_t mask = mask_of(reg);
+
+        t.add(reg);
+        continue;
+      }
+    }
+  }
+
+  return true;
+}
+
 } // namespace
