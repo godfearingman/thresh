@@ -209,4 +209,109 @@ bool step(const vtil::instruction &instr, live_set &t) {
   return true;
 }
 
+// merge each set from each successor into its predecessor, something like
+// set(A) = merge(set(B), set(C)) where B & C are A's successors, since our pass
+// will work backwards, A needs to inherit each successors set and so on and so
+// forth.
+live_set
+live_out(vtil::basic_block *block,
+         const std::unordered_map<vtil::basic_block *, live_set> &seen) {
+  live_set out;
+
+  // if there is no successor we can clearly tell that this is going to be a
+  // vexit or something we couldn't lift so we'll treat it as that it requires
+  // all.
+  const auto &succs = block->next;
+
+  if (!succs.size()) {
+    out.all();
+    return out;
+  }
+
+  // if we haven't encountered its successors yet there's no state to give back
+  // or merge so we just return nothing, else store its end set
+  for (auto *succ : succs) {
+    auto it = seen.find(succ);
+    if (it == seen.end())
+      return out;
+
+    out = out.merge(it->second.without_local());
+  }
+
+  return out;
+}
+
 } // namespace
+
+namespace vtil::passes {
+std::size_t reg_dce(vtil::routine *rtn) {
+  std::size_t result = 0;
+  std::unordered_map<vtil::basic_block *, live_set> seen = {};
+  std::deque<vtil::basic_block *> work = {};
+  std::unordered_set<vtil::basic_block *> waiting = {};
+
+  // insert all blocks in no particular order, the first pass will include sets
+  // into every block and most will be guessed but re-filled later.
+  for (const auto &[_, block] : rtn->explored_blocks) {
+    work.push_back(block.get());
+    waiting.insert(block.get());
+  }
+
+  while (!work.empty()) {
+    auto *block = work.back();
+    work.pop_back();
+    waiting.erase(block);
+
+    auto out = live_out(block, seen);
+    // out is currently the end of the block, we need to walk up through the
+    // block to the top and then store the set once it's filled with everything
+    // we need or don't
+    if (!block->empty()) {
+      auto [rbegin, rend] = reverse_iterators(*block);
+      for (auto it = rbegin; it != rend; ++it)
+        step(*it, out);
+    }
+
+    for (auto *pred : block->prev) {
+      auto it = seen.find(block);
+      // so we don't have trouble on loops, store the predecessor only if the
+      // set has changed or if it's on its first visit and it's not queue'd
+      // already.
+      if ((it == seen.end() || !(it->second == out)) &&
+          waiting.insert(pred).second)
+        work.push_back(pred);
+    }
+
+    seen[block] = std::move(out);
+  }
+
+  // we should now have collected each completed set for each block, merged when
+  // needed, now we need to work backwards through each blocks instructions and
+  // see if anything was removed or not
+  for (auto &[block, _] : seen) {
+    if (block->empty())
+      continue;
+
+    std::vector<vtil::il_iterator> dead_it = {};
+    auto out = live_out(block, seen);
+
+    auto [rbegin, rend] = reverse_iterators(*block);
+    for (auto it = rbegin; it != rend; ++it) {
+      bool remove = step(*it, out);
+      if (remove) // instruction is not dead, keep it
+        continue;
+
+      dead_it.push_back(it.revert());
+      ++result;
+    }
+
+    for (auto &it : dead_it)
+      block->erase(it);
+  }
+
+  if (result)
+    spdlog::info("[passes] removed {} dead code targeting registers", result);
+
+  return result;
+}
+} // namespace vtil::passes
