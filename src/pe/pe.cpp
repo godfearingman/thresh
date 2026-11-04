@@ -1,6 +1,6 @@
 #include "pe.hpp"
-#include <processthreadsapi.h>
-#include <winuser.h>
+#include "winnt.h"
+#include "winnt.h"
 
 // NOTE: Turn this into a factory method, it could fail.
 Pe::Pe(std::vector<std::uint8_t> &bytes, const std::string &name)
